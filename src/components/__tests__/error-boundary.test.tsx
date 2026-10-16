@@ -9,7 +9,7 @@ vi.mock("@/lib/errors", () => ({
 import { handleError } from "@/lib/errors";
 import { ErrorBoundary, IN_FLIGHT_TRANSACTION_KEY } from "../error-boundary";
 
-function ThrowingChild({ error = new Error("Render failed") }: { error?: Error }) {
+function ThrowingChild({ error = new Error("Render failed") }: { error?: Error }): never {
   throw error;
 }
 
