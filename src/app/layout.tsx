@@ -1,15 +1,10 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import { Geist, JetBrains_Mono } from "next/font/google";
 import Script from "next/script";
 import "./globals.css";
-import { WalletProvider } from "@/components/wallet-provider";
-import { FeatureFlagProvider } from "@/contexts/FeatureFlagContext";
-import { FeatureFlagPanel } from "@/components/FeatureFlagPanel";
-import { StatusBanner } from "@/components/status-banner";
-import Navbar from "@/components/navbar";
-import Footer from "@/components/footer";
-import { ServiceWorkerRegistrar } from "@/components/service-worker-registrar";
-import { OfflineBanner } from "@/components/offline-banner";
+import { ErrorBoundary, WalletErrorBoundary } from "@/components/error-boundary";
+import { AppChrome } from "@/components/app-chrome";
 
 const geist = Geist({
   subsets: ["latin"],
@@ -71,6 +66,11 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  // Read the per-request CSP nonce set by the middleware (#698). The enforcing
+  // Content-Security-Policy uses `script-src 'self' 'nonce-…'`, so every inline
+  // script must carry the matching nonce or the browser blocks it.
+  const nonce = headers().get("x-nonce") ?? undefined;
+
   const structuredData = {
     "@context": "https://schema.org",
     "@type": "WebApplication",
@@ -96,35 +96,18 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en" className={`${geist.variable} ${jetbrainsMono.variable}`}>
       <head>
         <Script
-          id="structured-data"
-          type="application/ld+json"
-          dangerouslySetInnerHTML={{
-            __html: JSON.stringify(structuredData),
-          }}
+          id="theme-init"
+          src="/theme-init.js"
+          strategy="beforeInteractive"
         />
+        <script
+          type="application/ld+json"
+        >
+          {JSON.stringify(structuredData).replace(/</g, "\\u003c")}
+        </script>
       </head>
       <body className="antialiased">
-        <FeatureFlagProvider>
-          <WalletProvider>
-            <StatusBanner />
-            <div className="min-h-screen flex flex-col">
-              <a
-                href="#main-content"
-                className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:px-4 focus:py-2 focus:rounded-lg focus:bg-[var(--primary)] focus:text-white focus:font-medium focus:shadow-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary-light)]"
-              >
-                Skip to main content
-              </a>
-              <Navbar />
-              <main id="main-content" tabIndex={-1} className="flex-1 pt-16">
-                {children}
-              </main>
-              <Footer />
-            </div>
-            <FeatureFlagPanel />
-            <ServiceWorkerRegistrar />
-            <OfflineBanner />
-          </WalletProvider>
-        </FeatureFlagProvider>
+        <AppChrome>{children}</AppChrome>
       </body>
     </html>
   );

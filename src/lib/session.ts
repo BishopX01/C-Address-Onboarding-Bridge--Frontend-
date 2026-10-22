@@ -28,10 +28,16 @@ export interface WalletSession {
   manuallyDisconnected: boolean;
   /** Epoch ms this record was last written. */
   updatedAt: number;
+  /**
+   * The wallet ID last chosen by the user in the Stellar Wallets Kit modal
+   * (e.g. "freighter", "xbull", "lobstr"). Persisted so the kit can restore
+   * the same module on the next page load. (#459)
+   */
+  selectedWalletId: string | null;
 }
 
 function freshSession(now: number): WalletSession {
-  return { address: null, manuallyDisconnected: false, updatedAt: now };
+  return { address: null, manuallyDisconnected: false, updatedAt: now, selectedWalletId: null };
 }
 
 function storage(): Storage | null {
@@ -46,7 +52,8 @@ function storage(): Storage | null {
 
 /** True when `session` is older than the TTL and should be discarded. */
 export function isSessionExpired(session: WalletSession, now: number = Date.now()): boolean {
-  throw new Error('Not implemented: isSessionExpired');
+  if (Number.isNaN(session.updatedAt)) return true;
+  return now - session.updatedAt > SESSION_TTL_MS;
 }
 
 function parseSession(raw: string | null): WalletSession | null {
@@ -59,6 +66,7 @@ function parseSession(raw: string | null): WalletSession | null {
       address: typeof candidate.address === "string" ? candidate.address : null,
       manuallyDisconnected: candidate.manuallyDisconnected === true,
       updatedAt: typeof candidate.updatedAt === "number" ? candidate.updatedAt : 0,
+      selectedWalletId: typeof candidate.selectedWalletId === "string" ? candidate.selectedWalletId : null,
     };
   } catch {
     return null;
@@ -69,9 +77,26 @@ function parseSession(raw: string | null): WalletSession | null {
  * Reads the stored session. Returns a fresh session when nothing is stored, the
  * record is unparseable, or it has expired — and drops the expired record so it
  * is not re-parsed on every call.
+ *
+ * A record stamped in the future (clock skew, or a tampered value) is also
+ * treated as expired here, on top of `isSessionExpired`'s own TTL check:
+ * `isSessionExpired` alone would see a negative age and call it "not yet
+ * past the TTL", so this rejection has to live at the call site that owns
+ * discarding the record.
  */
 export function loadSession(now: number = Date.now()): WalletSession {
-  throw new Error('Not implemented: loadSession');
+  const store = storage();
+  if (!store) return freshSession(now);
+
+  const raw = store.getItem(SESSION_STORAGE_KEY);
+  const session = parseSession(raw);
+
+  if (!session || session.updatedAt > now || isSessionExpired(session, now)) {
+    if (raw !== null) store.removeItem(SESSION_STORAGE_KEY);
+    return freshSession(now);
+  }
+
+  return session;
 }
 
 function writeSession(session: WalletSession): WalletSession {
@@ -87,8 +112,21 @@ function writeSession(session: WalletSession): WalletSession {
 }
 
 /** Records an explicit connect, clearing any sticky disconnect. */
-export function markConnected(address: string | null, now: number = Date.now()): WalletSession {
-  throw new Error('Not implemented: markConnected');
+export function markConnected(
+  address: string | null,
+  now: number = Date.now(),
+  selectedWalletId?: string | null,
+): WalletSession {
+  const session: WalletSession = {
+    address: address ?? null,
+    manuallyDisconnected: false,
+    updatedAt: now,
+    // Multi-wallet (#459): an explicit connect records which wallet answered.
+    // Omitting the argument keeps whatever wallet the session already had.
+    selectedWalletId:
+      selectedWalletId !== undefined ? selectedWalletId : loadSession(now).selectedWalletId,
+  };
+  return writeSession(session);
 }
 
 /**
@@ -96,10 +134,22 @@ export function markConnected(address: string | null, now: number = Date.now()):
  * debugging session) can tell which account was dropped.
  */
 export function markDisconnected(address: string | null = null, now: number = Date.now()): WalletSession {
-  throw new Error('Not implemented: markDisconnected');
+  const session: WalletSession = {
+    address: address ?? null,
+    manuallyDisconnected: true,
+    updatedAt: now,
+    selectedWalletId: loadSession(now).selectedWalletId,
+  };
+  return writeSession(session);
 }
 
 /** Removes the stored session entirely. */
 export function clearSession(): void {
-  throw new Error('Not implemented: clearSession');
+  const store = storage();
+  if (!store) return;
+  try {
+    store.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // Ignore errors in privacy mode
+  }
 }

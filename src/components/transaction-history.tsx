@@ -1,14 +1,25 @@
-import React, { memo, useMemo } from "react";
-import { ArrowLeftRight, CreditCard, Building2, ExternalLink, Loader2, Copy, Check, X } from "lucide-react";
-import type { BridgeTransactionData } from "@/lib/types";
+import React, { memo, useMemo, useState, useEffect, useRef } from "react";
+import { ArrowLeftRight, CreditCard, Building2, ExternalLink, Loader2, Copy, Check, X, Search } from "lucide-react";
+import type { BridgeTransactionData, BridgeTransactionStatus } from "@/lib/types";
 import { getExplorerUrl } from "@/lib/stellar";
 import type { StellarNetwork } from "@/lib/types";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
+import { useDelayedLoading } from "@/hooks/useDelayedLoading";
+import LiveRegion from "@/components/live-region";
+import TransactionExportControl from "@/components/transaction-export";
+
+/** Placeholder rows shown while `useDelayedLoading` gates the skeleton's visibility. */
+const SKELETON_ROW_COUNT = 3;
 
 const typeConfig: Record<string, { icon: typeof ArrowLeftRight; label: string; color: string }> = {
   "g-to-c": { icon: ArrowLeftRight, label: "G → C Bridge", color: "text-[var(--primary-light)]" },
   fiat: { icon: CreditCard, label: "Fiat Onramp", color: "text-[var(--secondary)]" },
   cex: { icon: Building2, label: "CEX Withdrawal", color: "text-[var(--accent)]" },
+  payment: { icon: ArrowLeftRight, label: "Payment", color: "text-[var(--text-muted)]" },
+  "path-payment": { icon: ArrowLeftRight, label: "Path Payment", color: "text-[var(--text-muted)]" },
+  "create-account": { icon: ArrowLeftRight, label: "Account Created", color: "text-[var(--text-muted)]" },
+  "account-merge": { icon: ArrowLeftRight, label: "Account Merge", color: "text-[var(--text-muted)]" },
+  "contract-transfer": { icon: ArrowLeftRight, label: "Contract Transfer", color: "text-[var(--text-muted)]" },
 };
 
 const statusConfig: Record<string, { label: string; color: string }> = {
@@ -16,6 +27,69 @@ const statusConfig: Record<string, { label: string; color: string }> = {
   confirmed: { label: "Confirmed", color: "text-[var(--success)]" },
   failed: { label: "Failed", color: "text-[var(--error)]" },
 };
+
+const STATUS_FILTERS: Array<{ value: "all" | BridgeTransactionStatus; label: string }> = [
+  { value: "all", label: "All statuses" },
+  { value: "pending", label: "Pending" },
+  { value: "confirmed", label: "Confirmed" },
+  { value: "failed", label: "Failed" },
+];
+
+/**
+ * A transaction is claimable once its G → C bridge has settled — a pending
+ * bridge has no funds on the C side yet, and fiat/CEX flows land directly in
+ * the destination account rather than a claimable timelock. This is the only
+ * eligibility signal `BridgeTransactionData` carries today; timelocked claims
+ * arriving alongside batch funding will likely add an explicit flag, but this
+ * keeps bulk claim meaningful (and its "not every row qualifies" case
+ * testable) in the meantime. (#486)
+ */
+function isClaimEligible(tx: BridgeTransactionData): boolean {
+  return tx.type === "g-to-c" && tx.status === "confirmed";
+}
+
+/** Minimal CSV escaping: quote any field containing a comma, quote or newline. */
+function csvField(value: string): string {
+  if (/[",\n]/.test(value)) return `"${value.replace(/"/g, '""')}"`;
+  return value;
+}
+
+/** Builds CSV text for a bulk export. Exported for direct unit testing. */
+export function buildTransactionsCsv(transactions: BridgeTransactionData[]): string {
+  const header = ["id", "type", "status", "amount", "asset", "toAddress", "hash", "timestamp"];
+  const rows = transactions.map((tx) =>
+    [
+      tx.id,
+      tx.type,
+      tx.status,
+      tx.amount,
+      tx.asset,
+      tx.toAddress,
+      tx.hash ?? "",
+      new Date(tx.timestamp).toISOString(),
+    ].map((v) => csvField(String(v)))
+  );
+  return [header.join(","), ...rows.map((r) => r.join(","))].join("\n");
+}
+
+/** Triggers a browser download of the CSV. Swallows environments (older test
+ *  runners, some SSR shells) that lack Blob/URL download support — the caller
+ *  still confirms success via the on-screen status message either way. */
+function downloadCsv(csv: string, filename: string): void {
+  try {
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch {
+    // See doc comment above.
+  }
+}
 
 interface Props {
   transactions: BridgeTransactionData[];
@@ -25,8 +99,23 @@ interface Props {
   address?: string;
 }
 
-const TransactionItem = memo(function TransactionItem({ tx, network }: { tx: BridgeTransactionData; network: Props["network"] }) {
-  const type = typeConfig[tx.type] || typeConfig["g-to-c"];
+// TODO(next-bounty): the bulk-actions feature (#486) was only half-merged into
+// main -- this component kept the selection UI while the parent's selection
+// state and claim handlers were lost in the merge. The orphaned pieces are
+// commented out below so the rest of the history view (search, filtering,
+// date range) keeps working. Re-integrate from commit 4237d8e.
+const TransactionItem = memo(function TransactionItem({
+  tx,
+  network,
+  selected,
+  onToggleSelected,
+}: {
+  tx: BridgeTransactionData;
+  network: Props["network"];
+  selected: boolean;
+  onToggleSelected: (id: string) => void;
+}) {
+  const type = typeConfig[tx.type] || typeConfig.payment;
   const status = statusConfig[tx.status];
   const Icon = type.icon;
 
@@ -44,6 +133,17 @@ const TransactionItem = memo(function TransactionItem({ tx, network }: { tx: Bri
     <div className="p-4 hover:bg-[var(--surface-2)] transition-colors">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3 min-w-0">
+          {/* Bulk-selection checkbox. Selection is intentionally allowed on
+              every row regardless of claim eligibility — mixed selections
+              (some rows eligible, some not) are the normal case the bulk
+              toolbar below has to explain, not something to prevent. (#486) */}
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={() => onToggleSelected(tx.id)}
+            aria-label={`Select ${type.label} of ${tx.amount} ${tx.asset}`}
+            className="w-4 h-4 flex-shrink-0 accent-[var(--primary)]"
+          />
           <div className="w-9 h-9 rounded-lg bg-[var(--surface-2)] flex items-center justify-center flex-shrink-0">
             <Icon className={`w-4 h-4 ${type.color}`} />
           </div>
@@ -107,33 +207,393 @@ const TransactionItem = memo(function TransactionItem({ tx, network }: { tx: Bri
   );
 });
 
+function parseDateToTimestamp(dateStr: string, endOfDay = false): number {
+  if (!dateStr) return 0;
+  const [year, month, day] = dateStr.split("-").map(Number);
+  if (endOfDay) {
+    return new Date(year, month - 1, day, 23, 59, 59, 999).getTime();
+  }
+  return new Date(year, month - 1, day, 0, 0, 0, 0).getTime();
+}
+
+function useDebounceValue<T>(value: T, delay: number): T {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedValue(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+
+  return debouncedValue;
+}
+
+function getInitialUrlState() {
+  if (typeof window === "undefined") {
+    return {
+      q: "",
+      status: "all",
+      asset: "all",
+      direction: "all",
+      from: "",
+      to: "",
+    };
+  }
+  const params = new URLSearchParams(window.location.search);
+  return {
+    q: params.get("q") || "",
+    status: params.get("status") || "all",
+    asset: params.get("asset") || "all",
+    direction: params.get("direction") || "all",
+    from: params.get("from") || "",
+    to: params.get("to") || "",
+  };
+}
+
 function TransactionHistory({ transactions, loading, network, address }: Props) {
-  const items = useMemo(
-    () => transactions.map((tx) => <TransactionItem key={tx.id} tx={tx} network={network} />),
-    [transactions, network]
+  const initial = getInitialUrlState();
+  const [searchQuery, setSearchQuery] = useState(initial.q);
+  const [statusFilter, setStatusFilter] = useState(initial.status);
+  const [assetFilter, setAssetFilter] = useState(initial.asset);
+  const [directionFilter, setDirectionFilter] = useState(initial.direction);
+  const [dateFrom, setDateFrom] = useState(initial.from);
+  const [dateTo, setDateTo] = useState(initial.to);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+
+  const debouncedSearchQuery = useDebounceValue(searchQuery, 300);
+  const showSkeleton = useDelayedLoading(loading, 200);
+
+  const uniqueAssets = useMemo(() => {
+    const assets = new Set<string>();
+    for (const tx of transactions) {
+      assets.add(tx.asset);
+    }
+    return Array.from(assets).sort();
+  }, [transactions]);
+
+  const hasActiveFilters =
+    debouncedSearchQuery ||
+    statusFilter !== "all" ||
+    assetFilter !== "all" ||
+    directionFilter !== "all" ||
+    dateFrom ||
+    dateTo;
+
+  const clearAllFilters = () => {
+    setSearchQuery("");
+    setStatusFilter("all");
+    setAssetFilter("all");
+    setDirectionFilter("all");
+    setDateFrom("");
+    setDateTo("");
+  };
+
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (debouncedSearchQuery) params.set("q", debouncedSearchQuery);
+    if (statusFilter !== "all") params.set("status", statusFilter);
+    if (assetFilter !== "all") params.set("asset", assetFilter);
+    if (directionFilter !== "all") params.set("direction", directionFilter);
+    if (dateFrom) params.set("from", dateFrom);
+    if (dateTo) params.set("to", dateTo);
+
+    const queryString = params.toString();
+    const newUrl = queryString ? `${window.location.pathname}?${queryString}` : window.location.pathname;
+    window.history.replaceState({}, "", newUrl);
+  }, [debouncedSearchQuery, statusFilter, assetFilter, directionFilter, dateFrom, dateTo]);
+
+  const filteredTransactions = useMemo(() => {
+    return transactions.filter((tx) => {
+      if (debouncedSearchQuery) {
+        const q = debouncedSearchQuery.toLowerCase();
+        const matchHash = tx.hash?.toLowerCase().includes(q);
+        const matchFrom = tx.fromAddress.toLowerCase().includes(q);
+        const matchTo = tx.toAddress.toLowerCase().includes(q);
+        const matchMemo = tx.memo?.toLowerCase().includes(q);
+        const matchAsset = tx.asset.toLowerCase().includes(q);
+        if (!matchHash && !matchFrom && !matchTo && !matchMemo && !matchAsset) return false;
+      }
+
+      if (statusFilter !== "all" && tx.status !== statusFilter) return false;
+      if (assetFilter !== "all" && tx.asset !== assetFilter) return false;
+
+      if (directionFilter !== "all" && address) {
+        if (directionFilter === "incoming" && tx.toAddress !== address) return false;
+        if (directionFilter === "outgoing" && tx.fromAddress !== address) return false;
+      }
+
+      const fromTimestamp = parseDateToTimestamp(dateFrom, false);
+      const toTimestamp = parseDateToTimestamp(dateTo, true);
+
+      if (fromTimestamp && tx.timestamp < fromTimestamp) return false;
+      if (toTimestamp && tx.timestamp > toTimestamp) return false;
+
+      return true;
+    });
+  }, [transactions, debouncedSearchQuery, statusFilter, assetFilter, directionFilter, dateFrom, dateTo, address]);
+
+  const selectedCount = useMemo(
+    () => transactions.reduce((count, tx) => count + (selectedIds.has(tx.id) ? 1 : 0), 0),
+    [transactions, selectedIds]
   );
+  const selectedTransactions = useMemo(
+    () => transactions.filter((tx) => selectedIds.has(tx.id)),
+    [transactions, selectedIds]
+  );
+  const claimIneligibleCount = selectedTransactions.filter((tx) => !isClaimEligible(tx)).length;
+  const canClaim = selectedCount > 0 && claimIneligibleCount === 0;
+  const claimDisabledReason =
+    selectedCount > 0 && claimIneligibleCount > 0
+      ? `${claimIneligibleCount} of ${selectedCount} selected transaction${selectedCount === 1 ? "" : "s"} can't be claimed — only confirmed G → C bridge transactions are eligible. Adjust your selection to claim the rest.`
+      : "";
+  const [confirmingClaim, setConfirmingClaim] = useState(false);
+  const [statusMessage, setStatusMessage] = useState("");
+  const filteredIds = useMemo(() => filteredTransactions.map((tx) => tx.id), [filteredTransactions]);
+  const selectedFilteredCount = useMemo(
+    () => filteredIds.reduce((count, id) => count + (selectedIds.has(id) ? 1 : 0), 0),
+    [filteredIds, selectedIds]
+  );
+  const allFilteredSelected =
+    filteredIds.length > 0 && selectedFilteredCount === filteredIds.length;
+  const someFilteredSelected = selectedFilteredCount > 0 && !allFilteredSelected;
+  const selectAllRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someFilteredSelected;
+  }, [someFilteredSelected]);
+
+  const toggleRow = (id: string) => {
+    setSelectedIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const toggleSelectAllFiltered = () => {
+    setSelectedIds((previous) => {
+      const next = new Set(previous);
+      filteredIds.forEach((id) => {
+        if (allFilteredSelected) next.delete(id);
+        else next.add(id);
+      });
+      return next;
+    });
+  };
+  const handleClaimClick = () => {
+    if (canClaim) setConfirmingClaim(true);
+  };
+  const handleExportClick = () => {
+    if (selectedCount === 0) return;
+    const csv = buildTransactionsCsv(selectedTransactions);
+    downloadCsv(csv, `transactions-${new Date().toISOString().slice(0, 10)}.csv`);
+    setStatusMessage(`Exported ${selectedCount} transaction${selectedCount === 1 ? "" : "s"}.`);
+  };
+  const handleConfirmClaim = () => {
+    setStatusMessage(`Claimed ${selectedCount} transaction${selectedCount === 1 ? "" : "s"}.`);
+    setSelectedIds((previous) => {
+      const next = new Set(previous);
+      selectedTransactions.forEach((tx) => next.delete(tx.id));
+      return next;
+    });
+    setConfirmingClaim(false);
+  };
+
+  const items = useMemo(
+    () =>
+      filteredTransactions.map((tx) => (
+        <TransactionItem
+          key={tx.id}
+          tx={tx}
+          network={network}
+          selected={selectedIds.has(tx.id)}
+          onToggleSelected={toggleRow}
+        />
+      )),
+    [filteredTransactions, network, selectedIds]
+  );
+
+  const showFilteredEmpty = !loading && hasActiveFilters && filteredTransactions.length === 0;
+  const showEmpty = !loading && !hasActiveFilters && transactions.length === 0;
 
   return (
     <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)]">
-      <div className="p-5 border-b border-[var(--border)]">
+      <div className="p-5 border-b border-[var(--border)] flex items-center justify-between gap-3">
         <h3 className="font-semibold">Recent Transactions</h3>
+        <TransactionExportControl address={address} network={network} />
       </div>
-      {loading ? (
-        // The spinner is the only loading indicator, and lucide marks its svg
-        // aria-hidden, so this panel was an empty box to a screen reader: no
-        // announcement on entering the loading state and no text to find when
-        // navigating into it. role="status" plus a hidden label fixes both.
-        <div role="status" className="p-12 flex items-center justify-center">
-          <Loader2 className="w-6 h-6 animate-spin motion-reduce:animate-none text-[var(--text-muted)]" />
-          <span className="sr-only">Loading recent transactions…</span>
+
+      <div className="p-4 border-b border-[var(--border)] space-y-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative flex-1 min-w-[200px]">
+            <Search className="absolute left-2.5 top-2.5 w-4 h-4 text-[var(--text-muted)]" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search hash, address, memo..."
+              aria-label="Search transactions"
+              className="w-full pl-9 pr-3 py-2 text-sm rounded-lg border border-[var(--border)] bg-[var(--surface)] focus:outline-none focus:ring-2 focus:ring-[var(--primary)]"
+            />
+          </div>
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            aria-label="Filter by status"
+            className="px-3 py-2 text-sm rounded-lg border border-[var(--border)] bg-[var(--surface)] focus:outline-none focus:ring-2 focus:ring-[var(--primary)]"
+          >
+            <option value="all">All statuses</option>
+            <option value="pending">Pending</option>
+            <option value="confirmed">Confirmed</option>
+            <option value="failed">Failed</option>
+          </select>
+          <select
+            value={assetFilter}
+            onChange={(e) => setAssetFilter(e.target.value)}
+            aria-label="Filter by asset"
+            className="px-3 py-2 text-sm rounded-lg border border-[var(--border)] bg-[var(--surface)] focus:outline-none focus:ring-2 focus:ring-[var(--primary)]"
+          >
+            <option value="all">All assets</option>
+            {uniqueAssets.map((asset) => (
+              <option key={asset} value={asset}>
+                {asset}
+              </option>
+            ))}
+          </select>
+          <select
+            value={directionFilter}
+            onChange={(e) => setDirectionFilter(e.target.value)}
+            aria-label="Filter by direction"
+            className="px-3 py-2 text-sm rounded-lg border border-[var(--border)] bg-[var(--surface)] focus:outline-none focus:ring-2 focus:ring-[var(--primary)]"
+          >
+            <option value="all">All directions</option>
+            <option value="incoming">Incoming</option>
+            <option value="outgoing">Outgoing</option>
+          </select>
+          <input
+            type="date"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+            aria-label="From date"
+            className="px-3 py-2 text-sm rounded-lg border border-[var(--border)] bg-[var(--surface)] focus:outline-none focus:ring-2 focus:ring-[var(--primary)]"
+          />
+          <input
+            type="date"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+            aria-label="To date"
+            className="px-3 py-2 text-sm rounded-lg border border-[var(--border)] bg-[var(--surface)] focus:outline-none focus:ring-2 focus:ring-[var(--primary)]"
+          />
+          {hasActiveFilters && (
+            <button
+              type="button"
+              onClick={clearAllFilters}
+              className="inline-flex items-center gap-1 px-3 py-2 text-sm font-medium text-[var(--error)] hover:bg-[var(--error)]/10 rounded-lg transition-colors"
+            >
+              <X className="w-4 h-4" />
+              Clear all
+            </button>
+          )}
         </div>
-      ) : transactions.length === 0 ? (
+        {!loading && transactions.length > 0 && (
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              ref={selectAllRef}
+              type="checkbox"
+              checked={allFilteredSelected}
+              onChange={toggleSelectAllFiltered}
+              disabled={filteredIds.length === 0}
+              aria-label={`Select all ${filteredIds.length} filtered transactions`}
+              className="w-4 h-4 accent-[var(--primary)]"
+            />
+            <span className="text-[var(--text-muted)]">
+              Select all {filteredIds.length} filtered
+            </span>
+          </label>
+        )}
+        {selectedCount > 0 && (
+          <div className="flex items-center gap-3">
+            <span className="text-sm font-medium" data-testid="selection-count">
+              {selectedCount} selected
+            </span>
+            <button
+              type="button"
+              onClick={() => setSelectedIds(new Set())}
+              className="text-sm text-[var(--text-muted)] hover:text-[var(--foreground)] transition-colors"
+            >
+              Clear selection
+            </button>
+            <button
+              type="button"
+              onClick={handleExportClick}
+              className="px-3 py-1.5 rounded-lg border border-[var(--border)] text-sm hover:bg-[var(--surface-2)] transition-colors"
+            >
+              Export
+            </button>
+            <button
+              type="button"
+              onClick={handleClaimClick}
+              disabled={!canClaim}
+              title={canClaim ? `Claim ${selectedCount} selected transactions` : claimDisabledReason}
+              className="px-3 py-1.5 rounded-lg bg-[var(--primary)] text-white text-sm hover:bg-[var(--primary)]/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Claim
+            </button>
+          </div>
+        )}
+        {claimDisabledReason && (
+          <p className="text-xs text-[var(--text-muted)]" role="note">
+            {claimDisabledReason}
+          </p>
+        )}
+      </div>
+
+      {loading && (
+        <div role="status" className="sr-only">
+          Loading recent transactions…
+        </div>
+      )}
+
+      {loading ? (
+        // Reserved unconditionally so layout doesn't shift once it becomes
+        // visible; `invisible` (rather than not rendering at all) is what lets
+        // `useDelayedLoading` gate *visibility* without a flash. (#485)
+        <div
+          aria-hidden="true"
+          className={`divide-y divide-[var(--border)]${showSkeleton ? "" : " invisible"}`}
+        >
+          {Array.from({ length: SKELETON_ROW_COUNT }).map((_, i) => (
+            <div key={i} className="p-4 flex items-center gap-3">
+              <div className="w-9 h-9 rounded-lg bg-[var(--surface-2)] animate-pulse motion-reduce:animate-none flex-shrink-0" />
+              <div className="min-w-0 flex-1 space-y-2">
+                <div className="h-3 w-28 rounded bg-[var(--surface-2)] animate-pulse motion-reduce:animate-none" />
+                <div className="h-3 w-40 rounded bg-[var(--surface-2)] animate-pulse motion-reduce:animate-none" />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : showEmpty ? (
         <div className="p-12 text-center">
           <p className="text-sm text-[var(--text-muted)]">No transactions found for this account.</p>
+        </div>
+      ) : showFilteredEmpty ? (
+        <div className="p-12 text-center">
+          <p className="text-sm text-[var(--text-muted)]">No transactions match your filters.</p>
+          <button
+            type="button"
+            onClick={clearAllFilters}
+            className="mt-3 inline-flex items-center gap-1 px-3 py-1.5 text-sm font-medium text-[var(--primary)] hover:bg-[var(--primary)]/10 rounded-lg transition-colors"
+          >
+            <X className="w-4 h-4" />
+            Clear all filters
+          </button>
+        </div>
+      ) : filteredTransactions.length === 0 ? (
+        <div className="p-12 text-center">
+          <p className="text-sm text-[var(--text-muted)]">No transactions match the current filter.</p>
         </div>
       ) : (
         <div className="divide-y divide-[var(--border)]">{items}</div>
       )}
+
       <div className="p-4 border-t border-[var(--border)]">
         {/* Link to the account's specific transaction history when an address
             is available, otherwise fall back to the explorer home. (#294) */}
@@ -151,6 +611,50 @@ function TransactionHistory({ transactions, loading, network, address }: Props) 
           <ExternalLink className="w-3 h-3" />
         </a>
       </div>
+
+      <LiveRegion message={statusMessage} />
+
+      {confirmingClaim && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="bulk-claim-title"
+          aria-describedby="bulk-claim-description"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: "rgba(0, 0, 0, 0.5)" }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") setConfirmingClaim(false);
+          }}
+          data-testid="bulk-claim-dialog"
+        >
+          <div className="card w-full max-w-sm p-6" style={{ boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.25)" }}>
+            <h2 id="bulk-claim-title" className="text-lg font-semibold mb-2">
+              Confirm claim
+            </h2>
+            <p id="bulk-claim-description" className="text-sm text-[var(--text-muted)] mb-6">
+              This claims {selectedCount} transaction{selectedCount === 1 ? "" : "s"} and moves funds on-chain.
+              This action cannot be undone.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setConfirmingClaim(false)}
+                autoFocus
+                className="px-4 py-2 rounded-lg border border-[var(--border)] text-sm hover:bg-[var(--surface-2)] transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmClaim}
+                className="px-4 py-2 rounded-lg bg-[var(--primary)] text-white text-sm font-medium hover:bg-[var(--primary)]/90 transition-colors"
+              >
+                Confirm claim
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

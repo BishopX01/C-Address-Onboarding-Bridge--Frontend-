@@ -1,11 +1,16 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { Wallet, Copy, Check, X, Save, Trash2 } from "lucide-react";
+import { useState } from "react";
+import { Wallet, Copy, Check, X, Save, Trash2, Sparkles } from "lucide-react";
 import Link from "next/link";
 import { useWallet } from "@/components/wallet-provider";
 import AvatarUpload from "@/components/avatar-upload";
 import LiveRegion from "@/components/live-region";
+import OnboardingModal from "@/components/OnboardingModal";
+import {
+  GUIDED_STEPS,
+  ONBOARDING_STORAGE_KEY,
+} from "@/components/onboarding-flow";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
 import { formatNetworkLabel } from "@/lib/stellar";
 import {
@@ -16,6 +21,7 @@ import {
   shortenAddress,
   validateDisplayName,
 } from "@/lib/profile";
+import { useHydrated } from "@/hooks/useHydrated";
 
 /**
  * Profile page (#325).
@@ -41,22 +47,16 @@ export default function ProfilePage() {
   } = useWallet();
   const { status: copyStatus, copy: copyToClipboard } = useCopyToClipboard();
 
-  const [name, setName] = useState("");
-  const [savedName, setSavedName] = useState<string | null>(null);
+  const hydrated = useHydrated();
+  const [nameEdit, setNameEdit] = useState<{ address: string | null; name: string; savedName: string | null } | null>(null);
+  const storedName = hydrated ? loadDisplayName(address) : null;
+  const name = nameEdit?.address === address ? nameEdit.name : storedName ?? "";
+  const savedName = nameEdit?.address === address ? nameEdit.savedName : storedName;
   const [nameError, setNameError] = useState<string | null>(null);
   const [nameNotice, setNameNotice] = useState("");
-
-  // Read from storage after mount only: touching localStorage during render
-  // would produce different server and client output and break hydration.
-  // Re-runs on address change so switching wallets loads that wallet's name.
-  useEffect(() => {
-    const stored = loadDisplayName(address);
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setSavedName(stored);
-    setName(stored ?? "");
-    setNameError(null);
-    setNameNotice("");
-  }, [address]);
+  // Controls the "reopen onboarding" modal (#472); the guide is reachable again
+  // from the profile page even after it was completed or skipped.
+  const [onboardingOpen, setOnboardingOpen] = useState(false);
 
   const handleSaveName = (event: React.FormEvent) => {
     event.preventDefault();
@@ -74,17 +74,15 @@ export default function ProfilePage() {
       return;
     }
     setNameError(null);
-    setSavedName(validation.value);
+    setNameEdit({ address, savedName: validation.value, name: validation.value });
     // Show the normalised value, so trailing whitespace visibly disappears
     // rather than silently differing from what was stored.
-    setName(validation.value);
     setNameNotice("Display name saved.");
   };
 
   const handleClearName = () => {
     clearDisplayName(address);
-    setSavedName(null);
-    setName("");
+    setNameEdit({ address, savedName: null, name: "" });
     setNameError(null);
     setNameNotice("Display name removed.");
   };
@@ -113,7 +111,7 @@ export default function ProfilePage() {
           </div>
           <h1 className="text-2xl font-bold mb-2">Connect Your Wallet</h1>
           <p className="text-[var(--text-muted)] mb-6">
-            Connect your Freighter wallet to view and edit your profile.
+            Connect your wallet to view and edit your profile.
           </p>
           <button
             type="button"
@@ -122,7 +120,7 @@ export default function ProfilePage() {
             className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-[var(--primary)] text-white font-medium hover:bg-[var(--primary)]/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Wallet className="w-4 h-4" />
-            {isConnecting ? "Connecting..." : "Connect Freighter"}
+            {isConnecting ? "Connecting..." : "Connect Wallet"}
           </button>
         </div>
       </div>
@@ -158,7 +156,7 @@ export default function ProfilePage() {
               type="text"
               value={name}
               onChange={(event) => {
-                setName(event.target.value);
+                setNameEdit({ address, name: event.target.value, savedName });
                 setNameError(null);
                 setNameNotice("");
               }}
@@ -252,12 +250,47 @@ export default function ProfilePage() {
         </dl>
       </section>
 
+      <section aria-labelledby="profile-guide" className="card p-6 mb-6">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <h2 id="profile-guide" className="text-lg font-semibold mb-1">
+              Onboarding guide
+            </h2>
+            <p className="text-sm text-[var(--text-muted)]">
+              Revisit the walkthrough that explains C-addresses and picks a
+              funding route. Progress is saved, so you resume where you left
+              off.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setOnboardingOpen(true)}
+            data-testid="reopen-onboarding"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[var(--primary)] text-white text-sm font-medium hover:bg-[var(--primary)]/90 transition-colors"
+          >
+            <Sparkles className="w-4 h-4" />
+            Open guide
+          </button>
+        </div>
+      </section>
+
       <Link
         href="/dashboard"
         className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] text-sm font-medium hover:border-[var(--text-muted)] transition-colors"
       >
         Back to dashboard
       </Link>
+
+      {/* Reopening uses the same persisted progress as the landing-page flow,
+          so skipping mid-way resumes here instead of restarting. Finishing
+          re-writes "completed" and keeps the landing page quiet. (#472) */}
+      <OnboardingModal
+        isOpen={onboardingOpen}
+        onClose={() => setOnboardingOpen(false)}
+        onComplete={() => setOnboardingOpen(false)}
+        steps={GUIDED_STEPS}
+        storageKey={ONBOARDING_STORAGE_KEY}
+      />
     </div>
   );
 }

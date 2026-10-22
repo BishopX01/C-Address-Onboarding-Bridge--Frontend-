@@ -17,7 +17,7 @@ describe('featureFlags (#490)', () => {
 
   afterEach(() => {
     global.fetch = originalFetch;
-    process.env.NODE_ENV = originalNodeEnv;
+    (process.env as { NODE_ENV?: string }).NODE_ENV = originalNodeEnv;
     vi.restoreAllMocks();
   });
 
@@ -84,13 +84,13 @@ describe('featureFlags (#490)', () => {
 
   describe('dev overrides', () => {
     it('only persist in development', () => {
-      process.env.NODE_ENV = 'production';
+      (process.env as { NODE_ENV?: string }).NODE_ENV = 'production';
       setDevOverride('some_flag', true);
       expect(getDevOverrides()).toEqual({});
     });
 
     it('round-trip in development', () => {
-      process.env.NODE_ENV = 'development';
+      (process.env as { NODE_ENV?: string }).NODE_ENV = 'development';
       setDevOverride('some_flag', true);
       expect(getDevOverrides()).toEqual({ some_flag: true });
       clearDevOverride('some_flag');

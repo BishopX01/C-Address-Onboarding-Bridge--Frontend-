@@ -1,15 +1,42 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Wallet, ArrowLeftRight, CreditCard, Building2, Copy, Check, ExternalLink, Plus, Loader2, X } from "lucide-react";
+import { useState, useEffect, useMemo } from "react";
+import { Wallet, ArrowLeftRight, CreditCard, Building2, Copy, Check, ExternalLink, Plus, Loader2, X, BarChart3 } from "lucide-react";
 import { useWallet } from "@/components/wallet-provider";
 import AvatarUpload from "@/components/avatar-upload";
 import TransactionHistory from "@/components/transaction-history";
+import ClaimsPanel from "@/components/claims-panel";
 import LiveRegion from "@/components/live-region";
 import Link from "next/link";
-import { getAccountBalances, fetchRecentTransactions, getExplorerUrl, formatNetworkLabel, toSafeErrorMessage } from "@/lib/stellar";
+import { getAccountBalances, fetchRecentTransactions, getExplorerUrl, formatNetworkLabel, toSafeErrorMessage, requestTestXLM } from "@/lib/stellar";
 import type { BridgeTransactionData } from "@/lib/stellar";
+import { getFeeTierPreview } from "@/lib/api";
+import type { FeeTierStatus } from "@/lib/feeTiers";
+import FeeTierDisplay from "@/components/fee-tier-display";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
+import { useDelayedLoading } from "@/hooks/useDelayedLoading";
+import { BarChart } from "@/components/bar-chart";
+
+/**
+ * Reserves the same two-line footprint as the loaded stat value (a bold
+ * number plus a small label) so a card never resizes when data arrives.
+ * `visible` gates only the pulse animation's visibility — the space is
+ * claimed for the whole loading state so there is no shift either way.
+ * (#485)
+ */
+function StatSkeleton({ visible, label }: { visible: boolean; label: string }) {
+  return (
+    <>
+      <div role="status" className="sr-only">
+        {label}
+      </div>
+      <div aria-hidden="true" className={`space-y-2 ${visible ? "" : "invisible"}`}>
+        <div className="h-7 w-20 rounded bg-[var(--surface-2)] animate-pulse motion-reduce:animate-none" />
+        <div className="h-3 w-10 rounded bg-[var(--surface-2)] animate-pulse motion-reduce:animate-none" />
+      </div>
+    </>
+  );
+}
 
 /** How often the dashboard polls for updated balances and transactions. */
 const DASHBOARD_POLL_INTERVAL_MS = 30_000;
@@ -28,6 +55,222 @@ function areTransactionsEqual(a: BridgeTransactionData[], b: BridgeTransactionDa
   return true;
 }
 
+// ─── Analytics (#479) ──────────────────────────────────────────────────────────
+//
+// Volume-over-time and transaction-count charts with a selectable range, an
+// asset breakdown, and a data-table alternative for screen reader users. The
+// aggregation is pure so it can be unit-tested without rendering; the chart
+// component reads CSS variables so bars stay readable in light and dark themes.
+
+export type AnalyticsRange = 7 | 30 | 90;
+
+export interface AnalyticsBucket {
+  /** ISO date key, e.g. "2026-08-01". */
+  date: string;
+  /** Short display label, e.g. "Aug 1". */
+  label: string;
+  /** Number of transactions on this day. */
+  count: number;
+  /** Volume per asset on this day. */
+  byAsset: Record<string, number>;
+}
+
+function toDateKey(timestamp: number): string {
+  const d = new Date(timestamp);
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${month}-${day}`;
+}
+
+function toLabel(dateKey: string): string {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  return new Date(year, month - 1, day).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+}
+
+/**
+ * Buckets transactions into the last `days` days (including today), zero-filled
+ * so the charts always show a continuous range. Only transactions within the
+ * range contribute; amounts that are not finite numbers are skipped. Volume is
+ * tracked per-asset to avoid summing incompatible currencies. (#715)
+ */
+export function aggregateAnalytics(
+  transactions: BridgeTransactionData[],
+  days: AnalyticsRange
+): AnalyticsBucket[] {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const buckets = new Map<string, AnalyticsBucket>();
+  for (let i = days - 1; i >= 0; i--) {
+    const day = new Date(today);
+    day.setDate(today.getDate() - i);
+    const dateKey = toDateKey(day.getTime());
+    buckets.set(dateKey, {
+      date: dateKey,
+      label: toLabel(dateKey),
+      count: 0,
+      byAsset: {},
+    });
+  }
+
+  for (const tx of transactions) {
+    const bucket = buckets.get(toDateKey(tx.timestamp));
+    if (!bucket) continue; // outside the selected range
+    const volume = Number(tx.amount);
+    if (!Number.isFinite(volume)) continue;
+    bucket.count += 1;
+    bucket.byAsset[tx.asset] = (bucket.byAsset[tx.asset] ?? 0) + volume;
+  }
+
+  return [...buckets.values()];
+}
+
+/** Compact volume display, e.g. "1,234.5". */
+function formatVolume(value: number): string {
+  return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+/**
+ * Analytics charts for the dashboard: volume and transaction count over a
+ * selectable range, broken down by asset, with a data table as the accessible
+ * alternative and an explicit empty state. Exported so tests can render it in
+ * isolation without a wallet. (#479)
+ */
+export function AnalyticsSection({ transactions }: { transactions: BridgeTransactionData[] }) {
+  const [range, setRange] = useState<AnalyticsRange>(30);
+  const buckets = useMemo(() => aggregateAnalytics(transactions, range), [transactions, range]);
+
+  const totals = useMemo(() => {
+    let count = 0;
+    const byAsset: Record<string, number> = {};
+    for (const bucket of buckets) {
+      count += bucket.count;
+      for (const [asset, value] of Object.entries(bucket.byAsset)) {
+        byAsset[asset] = (byAsset[asset] ?? 0) + value;
+      }
+    }
+    return { count, byAsset };
+  }, [buckets]);
+
+  const hasActivity = buckets.some((bucket) => bucket.count > 0);
+
+  return (
+    <section aria-labelledby="analytics-heading" className="card p-5 mb-8">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <div className="flex items-center gap-2">
+          <BarChart3 className="w-4 h-4 text-[var(--primary-light)]" />
+          <h3 id="analytics-heading" className="font-semibold">
+            Analytics
+          </h3>
+        </div>
+        <div role="group" aria-label="Analytics range" className="flex items-center gap-1">
+          {([7, 30, 90] as AnalyticsRange[]).map((days) => (
+            <button
+              key={days}
+              type="button"
+              onClick={() => setRange(days)}
+              aria-pressed={range === days}
+              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
+                range === days
+                  ? "bg-[var(--primary)]/15 text-[var(--primary-light)]"
+                  : "text-[var(--text-muted)] hover:text-[var(--foreground)] hover:bg-[var(--surface-2)]"
+              }`}
+            >
+              {days}D
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {!hasActivity ? (
+        <div className="p-10 text-center">
+          <p className="text-sm text-[var(--text-muted)]">
+            No activity in the last {range} days yet. Complete a bridge transaction to
+            see analytics here.
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="p-4 rounded-lg bg-[var(--surface-2)] mb-4">
+            <p className="text-xs text-[var(--text-muted)] mb-1">Transactions ({range}D)</p>
+            <p className="text-xl font-bold">{totals.count}</p>
+          </div>
+
+          <div className="mb-4">
+            <p className="text-xs text-[var(--text-muted)] mb-2">Transaction count over time</p>
+            <BarChart
+              buckets={buckets}
+              valueOf={(bucket) => bucket.count}
+              formatValue={formatVolume}
+              ariaLabel={`Transaction count over the last ${range} days`}
+              color="var(--secondary)"
+            />
+          </div>
+
+          <div className="mb-4">
+            <p className="text-xs text-[var(--text-muted)] mb-2">Volume by asset</p>
+            {Object.keys(totals.byAsset).length === 0 ? (
+              <p className="text-xs text-[var(--text-muted)]">No asset volume in this range.</p>
+            ) : (
+              <ul className="flex flex-wrap gap-3">
+                {Object.entries(totals.byAsset).map(([asset, volume]) => (
+                  <li key={asset} className="inline-flex items-center gap-2 text-sm">
+                    <span
+                      aria-hidden="true"
+                      className="w-2.5 h-2.5 rounded-full bg-[var(--primary)]"
+                    />
+                    {asset}: {formatVolume(volume)}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          {/* The accessible alternative to the charts: a data table screen
+              readers can navigate cell by cell. (#479) */}
+          <table
+            className="w-full text-xs"
+            aria-label={`Analytics data for the last ${range} days`}
+          >
+            <caption className="sr-only">Daily transaction count and volume by asset</caption>
+            <thead>
+              <tr className="text-left text-[var(--text-muted)] border-b border-[var(--border)]">
+                <th scope="col" className="py-2 pr-3 font-medium">
+                  Date
+                </th>
+                <th scope="col" className="py-2 pr-3 font-medium">
+                  Transactions
+                </th>
+                <th scope="col" className="py-2 font-medium">
+                  Volume (by asset)
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[var(--border)]">
+              {buckets.map((bucket) => (
+                <tr key={bucket.date}>
+                  <td className="py-1.5 pr-3">{bucket.label}</td>
+                  <td className="py-1.5 pr-3">{bucket.count}</td>
+                  <td className="py-1.5 text-xs text-[var(--text-muted)]">
+                    {Object.entries(bucket.byAsset).map(([asset, vol]) => (
+                      <div key={asset}>
+                        {asset}: {formatVolume(vol)}
+                      </div>
+                    ))}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+    </section>
+  );
+}
+
 export default function DashboardPage() {
   const { isConnected, address, network, networkStatus, walletNetworkName, isNetworkSupported, connect } = useWallet();
   const { status: copyStatus, copy: copyToClipboard } = useCopyToClipboard();
@@ -35,6 +278,10 @@ export default function DashboardPage() {
   const [transactions, setTransactions] = useState<BridgeTransactionData[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [faucetLoading, setFaucetLoading] = useState(false);
+  const [faucetMessage, setFaucetMessage] = useState<string | null>(null);
+  const [faucetError, setFaucetError] = useState<string | null>(null);
+  const [feeTierStatus, setFeeTierStatus] = useState<FeeTierStatus | null>(null);
 
   useEffect(() => {
     if (!isConnected || !address) return;
@@ -54,6 +301,14 @@ export default function DashboardPage() {
     const fetchData = async (isInitial: boolean) => {
       if (isInitial) setLoading(true);
       setError(null);
+      // The fee tier loads on its own rather than inside the Promise.all
+      // below: a slow or unreachable tier endpoint used to hold the balance and
+      // transaction cards in their loading state, so an empty account looked
+      // stuck instead of showing 0 XLM / 0 transactions. getFeeTierPreview
+      // never throws (it resolves null on any failure). (#653)
+      getFeeTierPreview(address, network).then((tierResult) => {
+        if (!cancelled) setFeeTierStatus(tierResult);
+      });
       try {
         const [balResult, txResult] = await Promise.all([
           getAccountBalances(address, network),
@@ -94,7 +349,11 @@ export default function DashboardPage() {
   // Chain data is only shown for a network the app actually queried. (#289)
   const shownTransactions = isNetworkSupported ? transactions : [];
   const shownBalance = isNetworkSupported ? balance : null;
+  const shownFeeTierStatus = isNetworkSupported ? feeTierStatus : null;
   const showLoading = loading && isNetworkSupported;
+  // Waits ~200ms of continuous loading before the stat card skeletons become
+  // visible, so a fast/cached fetch never flashes them. (#485)
+  const showStatSkeleton = useDelayedLoading(showLoading, 200);
 
   const confirmedCount = shownTransactions.filter((t) => t.status === "confirmed").length;
   const pendingCount = shownTransactions.filter((t) => t.status === "pending").length;
@@ -115,6 +374,20 @@ export default function DashboardPage() {
         ? "Copy failed. Check clipboard permissions and try again."
         : "";
 
+  const handleFaucet = async () => {
+    if (!address) return;
+    setFaucetLoading(true);
+    setFaucetMessage(null);
+    setFaucetError(null);
+    const result = await requestTestXLM(address);
+    if (result.success) {
+      setFaucetMessage(result.message ?? "Test XLM requested.");
+    } else {
+      setFaucetError(result.message ?? "Faucet request failed.");
+    }
+    setFaucetLoading(false);
+  };
+
   if (!isConnected) {
     return (
       <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-24">
@@ -124,14 +397,14 @@ export default function DashboardPage() {
           </div>
           <h1 className="text-2xl font-bold mb-2">Connect Your Wallet</h1>
           <p className="text-[var(--text-muted)] mb-6">
-            Connect your Freighter wallet to view your dashboard.
+            Connect your wallet to view your dashboard.
           </p>
           <button
             onClick={connect}
             className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-[var(--primary)] text-white font-medium hover:bg-[var(--primary)]/90 transition-colors"
           >
             <Wallet className="w-4 h-4" />
-            Connect Freighter
+            Connect Wallet
           </button>
         </div>
       </div>
@@ -157,6 +430,34 @@ export default function DashboardPage() {
       <div className="card p-5 mb-8">
         <AvatarUpload address={address ?? null} />
       </div>
+
+      {isConnected && (
+        <div className="card p-5 mb-8">
+          <h2 className="text-sm font-medium text-[var(--text-muted)] mb-3">Developer Checklist</h2>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-sm">
+              {isConnected ? <Check className="w-4 h-4 text-[var(--success)]" /> : <X className="w-4 h-4 text-[var(--text-muted)]" />}
+              <span className={isConnected ? "text-[var(--text-primary)]" : "text-[var(--text-muted)]"}>
+                Connect wallet
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-sm">
+              {shownBalance !== null && parseFloat(shownBalance) > 0 ? (
+                <Check className="w-4 h-4 text-[var(--success)]" />
+              ) : (
+                <X className="w-4 h-4 text-[var(--text-muted)]" />
+              )}
+              <span className={shownBalance !== null && parseFloat(shownBalance) > 0 ? "text-[var(--text-primary)]" : "text-[var(--text-muted)]"}>
+                Fund account
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-sm">
+              <ArrowLeftRight className="w-4 h-4 text-[var(--text-muted)]" />
+              <span className="text-[var(--text-muted)]">Bridge assets</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
         <div className="card p-5">
@@ -213,16 +514,37 @@ export default function DashboardPage() {
         <div className="card p-5">
           <div className="text-xs text-[var(--text-muted)] mb-1">XLM Balance</div>
           {showLoading ? (
-            <div className="flex items-center gap-2">
-              <Loader2 className="w-4 h-4 animate-spin motion-reduce:animate-none text-[var(--text-muted)]" />
-              <span className="text-xs text-[var(--text-muted)]">Loading...</span>
-            </div>
+            <StatSkeleton visible={showStatSkeleton} label="Loading balance…" />
           ) : (
             <>
               <div className="text-2xl font-bold mb-1">
                 {shownBalance !== null ? parseFloat(shownBalance).toFixed(2) : "—"}
               </div>
               <div className="text-xs text-[var(--text-muted)]">XLM</div>
+              {network === "TESTNET" && !showLoading && (shownBalance === null || parseFloat(shownBalance) === 0) && (
+                <div className="mt-3">
+                  <button
+                    onClick={handleFaucet}
+                    disabled={faucetLoading}
+                    className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[var(--primary)]/10 text-[var(--primary-light)] text-xs font-medium hover:bg-[var(--primary)]/20 transition-colors disabled:opacity-50"
+                  >
+                    {faucetLoading ? (
+                      <>
+                        <Loader2 className="w-3 h-3 animate-spin motion-reduce:animate-none" />
+                        Requesting...
+                      </>
+                    ) : (
+                      "Request Test XLM"
+                    )}
+                  </button>
+                  {faucetMessage && (
+                    <p className="text-xs text-[var(--success)] mt-2">{faucetMessage}</p>
+                  )}
+                  {faucetError && (
+                    <p className="text-xs text-[var(--error)] mt-2">{faucetError}</p>
+                  )}
+                </div>
+              )}
             </>
           )}
         </div>
@@ -230,10 +552,7 @@ export default function DashboardPage() {
         <div className="card p-5">
           <div className="text-xs text-[var(--text-muted)] mb-1">Transactions</div>
           {showLoading ? (
-            <div className="flex items-center gap-2">
-              <Loader2 className="w-4 h-4 animate-spin motion-reduce:animate-none text-[var(--text-muted)]" />
-              <span className="text-xs text-[var(--text-muted)]">Loading...</span>
-            </div>
+            <StatSkeleton visible={showStatSkeleton} label="Loading transaction count…" />
           ) : (
             <>
               <div className="text-2xl font-bold mb-1">{shownTransactions.length}</div>
@@ -244,6 +563,13 @@ export default function DashboardPage() {
           )}
         </div>
       </div>
+
+      {shownFeeTierStatus && (
+        <div className="mb-8">
+          <h3 className="text-sm font-semibold mb-2 text-[var(--text-muted)]">Fee Tier</h3>
+          <FeeTierDisplay status={shownFeeTierStatus} />
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
         <Link
@@ -286,14 +612,18 @@ export default function DashboardPage() {
         </Link>
       </div>
 
+      {/* Activity-over-time charts with a selectable range and an accessible
+          data table. Built from the same transaction list shown below. (#479) */}
+      <AnalyticsSection transactions={shownTransactions} />
+
       {!isNetworkSupported && (
         <div
           role="alert"
           className="mb-6 p-4 rounded-lg bg-[var(--error)]/10 border border-[var(--error)]/20 text-sm text-[var(--error)]"
         >
           {networkStatus === "UNSUPPORTED"
-            ? `Freighter is on ${formatNetworkLabel(networkStatus, walletNetworkName)}, which this app doesn't support. Switch to Testnet or Mainnet to see balances and activity.`
-            : "Freighter's network couldn't be read, so no chain data is shown. Unlock the extension and reload."}
+            ? `Your wallet is on ${formatNetworkLabel(networkStatus, walletNetworkName)}, which this app doesn't support. Switch to Testnet or Mainnet to see balances and activity.`
+            : "Your wallet's network couldn't be read, so no chain data is shown. Unlock the extension and reload."}
         </div>
       )}
 
@@ -311,6 +641,10 @@ export default function DashboardPage() {
       )}
 
       <TransactionHistory transactions={shownTransactions} loading={showLoading} network={network} address={address ?? undefined} />
+
+      <div className="mt-8">
+        <ClaimsPanel address={address ?? null} network={network} isNetworkSupported={isNetworkSupported} />
+      </div>
     </div>
   );
 }

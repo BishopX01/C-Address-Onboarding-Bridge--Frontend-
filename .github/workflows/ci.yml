@@ -18,7 +18,13 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm audit --audit-level=high
+
+      # Blocking. Transitive advisories through @creit.tech/stellar-wallets-kit
+      # and @stellar/stellar-sdk are pinned to patched versions via `overrides`
+      # in package.json.
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run test
@@ -28,7 +34,15 @@ jobs:
       - run: npm run build
         env:
           ENFORCE_BUDGET: "true"
+          # A production build now fails fast if this is unset (#675) — CI
+          # only verifies the build succeeds, not real backend connectivity,
+          # so a placeholder is enough. A real deployment must set its own.
+          NEXT_PUBLIC_API_URL: "https://api.ci-placeholder.example"
 
+  # Blocking. The specs in e2e/ are currently skipped (see the TODO at the top
+  # of e2e/funding-flow.spec.ts -- their selectors drifted while this job could
+  # not run), but the job still starts the app via Playwright's webServer, so a
+  # dev server that fails to boot -- as it did under Next 16 -- fails CI.
   e2e-tests:
     name: End-to-End Tests
     runs-on: ubuntu-latest

@@ -25,11 +25,20 @@ export const FEATURE_FLAGS: FeatureFlag[] = [
     defaultEnabled: false,
     rolloutPercentage: 0,
   },
+  {
+    key: 'locked_transfers',
+    name: 'Locked Transfers & Claims',
+    description:
+      'Timelocked funding (#467) and its claims panel — off until the /locks API in src/lib/api.ts is backed by a real route (#672)',
+    defaultEnabled: false,
+    rolloutPercentage: 0,
+  },
 ];
 
 const FLAGS_ENDPOINT = '/api/feature-flags';
 const REMOTE_CACHE_KEY = 'ff_remote_cache';
 const REMOTE_FETCH_TIMEOUT_MS = 3000;
+const BUCKET_ID_KEY = 'ff_bucket_id';
 
 let remoteFlagsMemo: FeatureFlag[] | null = null;
 
@@ -111,22 +120,25 @@ export function isFeatureEnabled(
   key: string,
   sessionId?: string,
 ): boolean {
+  const normalizedKey = key.trim();
+  if (!normalizedKey) return false;
+
   if (process.env.NODE_ENV === 'development') {
     const overrides = getDevOverrides();
-    if (key in overrides) return overrides[key];
+    if (normalizedKey in overrides) return overrides[normalizedKey];
   }
 
   const envFlags = parseEnvFlags();
-  if (key in envFlags) return envFlags[key];
+  if (normalizedKey in envFlags) return envFlags[normalizedKey];
 
-  const flag = getFlagDef(key);
+  const flag = getFlagDef(normalizedKey);
   if (!flag) return false;
 
   if (flag.rolloutPercentage <= 0) return flag.defaultEnabled;
   if (flag.rolloutPercentage >= 100) return true;
 
-  const id = sessionId ?? getSessionId();
-  const bucket = deterministicHash(`${key}:${id}`) % 100;
+  const id = sessionId ?? getBucketId();
+  const bucket = deterministicHash(`${normalizedKey}:${id}`) % 100;
   return bucket < flag.rolloutPercentage;
 }
 
@@ -143,18 +155,30 @@ function deterministicHash(str: string): number {
 }
 
 /**
- * Get or create a session ID for deterministic rollout.
+ * Get or create a stable bucketing id for deterministic rollout.
+ *
+ * Uses localStorage (not sessionStorage) so the same user lands in the same
+ * rollout bucket across tabs and across new sessions. Falls back to an
+ * in-memory id when storage is unavailable so evaluation stays deterministic
+ * within the page lifetime.
  */
-function getSessionId(): string {
+function getBucketId(): string {
   if (typeof window === 'undefined') return 'server';
-  
-  let id = sessionStorage.getItem('ff_session_id');
-  if (!id) {
-    id = Math.random().toString(36).slice(2);
-    sessionStorage.setItem('ff_session_id', id);
+
+  try {
+    let id = window.localStorage.getItem(BUCKET_ID_KEY);
+    if (!id) {
+      id = Math.random().toString(36).slice(2);
+      window.localStorage.setItem(BUCKET_ID_KEY, id);
+    }
+    return id;
+  } catch {
+    // Storage unavailable — fall back to a per-page id.
+    return memoryBucketId;
   }
-  return id;
 }
+
+let memoryBucketId = Math.random().toString(36).slice(2);
 
 const DEV_OVERRIDES_KEY = 'ff_dev_overrides';
 
@@ -181,7 +205,9 @@ export function getDevOverrides(): Record<string, boolean> {
     ) {
       return {};
     }
-    return parsed as Record<string, boolean>;
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([key]) => key.trim().length > 0)
+    ) as Record<string, boolean>;
   } catch {
     return {};
   }
@@ -197,8 +223,10 @@ export function getDevOverrides(): Record<string, boolean> {
 export function setDevOverride(key: string, enabled: boolean): void {
   if (process.env.NODE_ENV !== 'development' || typeof window === 'undefined') return;
   try {
+    const normalizedKey = key.trim();
+    if (!normalizedKey) return;
     const overrides = getDevOverrides();
-    overrides[key] = enabled;
+    overrides[normalizedKey] = enabled;
     window.localStorage.setItem(DEV_OVERRIDES_KEY, JSON.stringify(overrides));
   } catch {
     // Storage unavailable — override simply won't persist this session.
@@ -214,8 +242,14 @@ export function setDevOverride(key: string, enabled: boolean): void {
 export function clearDevOverride(key: string): void {
   if (process.env.NODE_ENV !== 'development' || typeof window === 'undefined') return;
   try {
+    const normalizedKey = key.trim();
+    if (!normalizedKey) return;
     const overrides = getDevOverrides();
-    delete overrides[key];
+    delete overrides[normalizedKey];
+    if (Object.keys(overrides).length === 0) {
+      window.localStorage.removeItem(DEV_OVERRIDES_KEY);
+      return;
+    }
     window.localStorage.setItem(DEV_OVERRIDES_KEY, JSON.stringify(overrides));
   } catch {
     // Storage unavailable — nothing to clear.
@@ -229,15 +263,12 @@ export function clearDevOverride(key: string): void {
 function parseEnvFlags(): Record<string, boolean> {
   const raw = process.env.NEXT_PUBLIC_FEATURE_FLAGS ?? '';
   if (!raw) return {};
-  
+
   return Object.fromEntries(
-    raw.split(',')
-      .map(pair => pair.trim())
-      .filter(pair => pair.length > 0)
-      .map(pair => {
-        const [k, v] = pair.split('=');
-        return [k?.trim() || '', v?.trim() === 'true'] as [string, boolean];
-      })
-      .filter(([k]) => k.length > 0)
+    raw
+      .split(',')
+      .map((pair) => pair.split('='))
+      .filter(([k, v]) => k && v !== undefined)
+      .map(([k, v]) => [k.trim(), v.trim() === 'true'])
   );
 }

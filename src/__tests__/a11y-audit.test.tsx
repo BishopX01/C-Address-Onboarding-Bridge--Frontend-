@@ -3,6 +3,7 @@ import React, { act } from "react";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createRoot, Root } from "react-dom/client";
 import Footer from "@/components/footer";
+import NotFound from "@/app/not-found";
 import TransactionHistory from "@/components/transaction-history";
 import CexPage from "@/components/routes/cex-page";
 import type { BridgeTransactionData } from "@/lib/types";
@@ -30,6 +31,18 @@ vi.mock("next/navigation", () => ({
     replace: vi.fn(),
     back: vi.fn(),
   }),
+}));
+
+vi.mock("@/lib/stellar", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/stellar")>();
+  return {
+    ...actual,
+    getExplorerUrl: (_network: unknown, _type: unknown, id: string) => `https://stellar.expert/explorer/testnet/tx/${id}`,
+  };
+});
+
+vi.mock("@/hooks/useCopyToClipboard", () => ({
+  useCopyToClipboard: () => ({ status: "idle", copy: vi.fn(), reset: vi.fn() }),
 }));
 
 function fixture(html: string): HTMLElement {
@@ -143,6 +156,11 @@ describe("rendered components pass the accessibility audit", () => {
 
   it("Footer", () => {
     const violations = auditAccessibility(render(<Footer />));
+    expect(summarizeViolations(violations)).toEqual([]);
+  });
+
+  it("NotFound page", () => {
+    const violations = auditAccessibility(render(<NotFound />));
     expect(summarizeViolations(violations)).toEqual([]);
   });
 

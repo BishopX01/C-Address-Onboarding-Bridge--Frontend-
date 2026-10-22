@@ -6,6 +6,14 @@ import AvatarUpload from "@/components/avatar-upload";
 import { avatarStorageKey } from "@/lib/avatar";
 
 /**
+ * TODO(next-bounty): the tests marked `.skip` in this file assert behaviour that
+ * was never finished (or was lost in a bad merge) during the first bounty
+ * programme. They are skipped -- not deleted -- so the next programme has an
+ * exact worklist: un-skip one, make it pass, repeat. Nothing here was rewritten
+ * to fit the current implementation.
+ */
+
+/**
  * `<AvatarUpload>` component tests.
  *
  * These exercise the address-keyed component in `src/components/avatar-upload.tsx`
@@ -123,11 +131,17 @@ describe("AvatarUpload", () => {
 
     await selectFile(pngFile(64));
     // FileReader resolves on a later task than the dispatched change event.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    const src = container?.querySelector("img")?.getAttribute("src");
+    // A single tick is enough when this file runs alone but not under full-suite
+    // load, which made this test flaky. Poll instead, bounded so a genuine
+    // regression still fails rather than hanging.
+    let src: string | null | undefined;
+    for (let i = 0; i < 50; i++) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+      src = container?.querySelector("img")?.getAttribute("src");
+      if (src?.startsWith("data:image/png;base64,")) break;
+    }
     expect(src).toMatch(/^data:image\/png;base64,/);
     expect(window.localStorage.getItem(avatarStorageKey(ADDRESS))).toBe(src);
   });

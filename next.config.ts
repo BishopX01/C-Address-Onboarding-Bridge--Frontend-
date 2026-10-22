@@ -26,18 +26,17 @@ const withBundleAnalyzer = bundleAnalyzer({
 /**
  * Initial JS budget for the client entrypoint, in bytes.
  *
- * 1100 KB is a **ratchet, not a target**: it is set just above what the largest
- * route (`/profile`, ~1000 KB) actually ships today, so the build fails when a
- * change makes things worse. The number this config previously carried was
- * 100 KB, which no route has met for a long time — with enforcement wired up
- * again, that value would fail every CI build regardless of the change under
- * test, which is why it is not restored as-is.
- *
- * Lower it as routes get smaller; the biggest single win available is the
- * ~700 KB `@stellar/stellar-sdk` pulled into every wallet-aware route.
+ * 700 KB is a **ratchet, not a target**: the largest route currently loads
+ * 675 KB of JavaScript on first render. The Stellar SDK remains available in a
+ * deferred chunk and is fetched only when a Stellar network/transaction
+ * operation needs it.
  */
 const initialJsBudgetBytes =
-  Number(process.env.NEXT_PUBLIC_INITIAL_JS_BUDGET_KB ?? "1100") * 1024;
+  Number(process.env.NEXT_PUBLIC_INITIAL_JS_BUDGET_KB ?? "700") * 1024;
+
+// The transaction-only SDK chunk exceeds the initial route budget. Keep a
+// separate 1 MB per-asset ceiling so lazy transaction code doesn't trip it.
+const maxJsAssetBytes = 1024 * 1024;
 
 // In CI, flip webpack performance hints from "warning" to "error" so that
 // bundle-size budget violations fail the build instead of scrolling past.
@@ -63,7 +62,7 @@ const CSP_HEADER_NAME = "Content-Security-Policy-Report-Only";
 // calls will be blocked once this header is enforcing.
 const cspHeader = `
   default-src 'self';
-  script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""};
+  script-src 'self'${isDev ? " 'unsafe-eval'" : ""};
   style-src 'self' 'unsafe-inline';
   img-src 'self' data:;
   font-src 'self';
@@ -86,6 +85,36 @@ const securityHeaders = [
   {
     key: "X-Frame-Options",
     value: "DENY",
+  },
+  {
+    key: "Referrer-Policy",
+    value: "strict-origin-when-cross-origin",
+  },
+  {
+    key: "Permissions-Policy",
+    value: "camera=(), microphone=(), geolocation=(), payment=()",
+  },
+];
+
+/**
+ * The embeddable widget (#558) exists specifically to be framed by
+ * third-party host pages, so it can't ship the blanket `frame-ancestors
+ * 'none'` / `X-Frame-Options: DENY` above — that would break every embed.
+ * There's no "any origin may frame me" value for X-Frame-Options (ALLOW-FROM
+ * is deprecated and ignored by current browsers), so it's omitted here
+ * rather than set to something misleading; `frame-ancestors *` is the actual,
+ * modern equivalent. The real security boundary for the widget isn't "who
+ * can put us in an iframe" — it's the postMessage origin check in
+ * src/lib/widget.ts, since the widget never trusts a message (or reveals a
+ * result) without validating the declared parent origin.
+ */
+const widgetSecurityHeaders = [
+  {
+    key: CSP_HEADER_NAME,
+    value: cspHeader
+      .replace(/frame-ancestors 'none';/, "frame-ancestors *;")
+      .replace(/\s{2,}/g, " ")
+      .trim(),
   },
   {
     key: "Referrer-Policy",
@@ -123,9 +152,15 @@ const nextConfig: NextConfig = {
 
   async headers() {
     return [
+      // Excludes /widget so its relaxed frame-ancestors below is the only
+      // one ever applied there — no two entries ever match the same path.
       {
-        source: "/(.*)",
+        source: "/((?!widget).*)",
         headers: securityHeaders,
+      },
+      {
+        source: "/widget/:path*",
+        headers: widgetSecurityHeaders,
       },
     ];
   },
@@ -144,7 +179,7 @@ const nextConfig: NextConfig = {
       config.performance = {
         ...config.performance,
         maxEntrypointSize: initialJsBudgetBytes,
-        maxAssetSize: Math.max(initialJsBudgetBytes, 200 * 1024),
+        maxAssetSize: Math.max(maxJsAssetBytes, initialJsBudgetBytes),
         hints:
           process.env.NODE_ENV === "production"
             ? enforceBudget

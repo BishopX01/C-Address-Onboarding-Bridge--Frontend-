@@ -1,7 +1,8 @@
 'use client';
 
-import React, { useState, useCallback } from 'react';
-import { StrKey } from '@stellar/stellar-sdk';
+import React, { useState, useCallback, useEffect, useId } from 'react';
+import { loadAddressBook, type SavedRecipient } from '@/lib/addressBook';
+import { validateStellarAddress } from '@/lib/addressValidation';
 
 export interface AddressFormProps {
   onSubmit: (address: string) => void;
@@ -12,73 +13,14 @@ export interface AddressFormProps {
 }
 
 /** Shortens an address for display: GABCDEFG…WXYZ. */
-function truncateAddress(address: string): string {
+export function truncateAddress(address: string): string {
   return address.length > 12
     ? `${address.slice(0, 8)}…${address.slice(-4)}`
     : address;
 }
 
-/**
- * Validates a Stellar public key (G... address), distinguishing the specific
- * ways a paste can go wrong so the message tells the user what to fix rather
- * than just that something is wrong. A wrong destination address is
- * unrecoverable once funds are sent, so precise feedback here is a safety
- * feature, not polish. (#488)
- */
-export function validateStellarAddress(address: string): {
-  valid: boolean;
-  error?: string;
-} {
-  const trimmed = address.trim();
-
-  if (!trimmed) {
-    return { valid: false, error: 'Address is required' };
-  }
-
-  // The most common source of misdirected funds: a Soroban smart-account
-  // (C-address) pasted where a classic G-address is required. Naming this
-  // explicitly instead of falling through to "must start with G" turns the
-  // project's central premise — G vs C — from a confusing generic error into
-  // an actionable one.
-  if (StrKey.isValidContract(trimmed)) {
-    return {
-      valid: false,
-      error:
-        'This is a C-address (Soroban smart account) — this field needs a G-address (classic Stellar account) instead.',
-    };
-  }
-
-  if (!trimmed.startsWith('G')) {
-    return { valid: false, error: 'Stellar addresses must start with G' };
-  }
-
-  if (trimmed.length < 56) {
-    return {
-      valid: false,
-      error: `Address looks cut off — it's ${trimmed.length} of 56 characters. Check the paste didn't get truncated.`,
-    };
-  }
-
-  if (trimmed.length > 56) {
-    return {
-      valid: false,
-      error: `Address is too long — Stellar addresses are exactly 56 characters (this one has ${trimmed.length}).`,
-    };
-  }
-
-  try {
-    if (!StrKey.isValidEd25519PublicKey(trimmed)) {
-      return {
-        valid: false,
-        error: 'Invalid address — the checksum does not match. Double-check for a mistyped or altered character.',
-      };
-    }
-  } catch {
-    return { valid: false, error: 'Invalid Stellar address format' };
-  }
-
-  return { valid: true };
-}
+// Moved to `src/lib/addressValidation.ts` (#721); re-exported for existing callers.
+export { validateStellarAddress };
 
 /**
  * Address input form with real-time Stellar address validation.
@@ -93,6 +35,10 @@ export function AddressForm({
   const [address, setAddress] = useState(initialValue);
   const [error, setError] = useState<string | undefined>();
   const [touched, setTouched] = useState(false);
+  const hydrated = useHydrated();
+  const datalistId = useId();
+  const recipients = hydrated ? loadAddressBook() : [];
+  const matchedRecipient = recipients.find((r) => r.address === address.trim());
 
   // Validation runs on blur, not on every keystroke (#488) — showing an error
   // mid-paste or mid-type would flag characters the user hasn't finished
@@ -136,7 +82,13 @@ export function AddressForm({
       >
         {label}
       </label>
-      <div style={{ display: 'flex', gap: '8px' }}>
+      {/*
+        Mobile-optimised layout (#487): stacked full-width input/button below
+        the `sm` breakpoint so the tap target for each is comfortably wide,
+        and side-by-side above it. `minHeight: 44px` on both controls meets
+        the ~44px touch-target guideline on every viewport.
+      */}
+      <div className="flex flex-col sm:flex-row" style={{ gap: '8px' }}>
         <input
           id="stellar-address"
           type="text"
@@ -148,22 +100,35 @@ export function AddressForm({
           data-testid="address-input"
           aria-invalid={!!error}
           aria-describedby={error ? 'address-error' : undefined}
+          list={recipients.length > 0 ? datalistId : undefined}
           style={{
-            flex: 1,
-            padding: '10px 12px',
+            padding: '12px',
+            minHeight: '44px',
             borderRadius: '8px',
             border: `1px solid ${error ? '#ef4444' : '#d1d5db'}`,
             fontSize: '14px',
             fontFamily: 'monospace',
             outline: 'none',
+            boxSizing: 'border-box',
           }}
         />
+        {recipients.length > 0 && (
+          <datalist id={datalistId} data-testid="address-recipients-list">
+            {recipients.map((recipient) => (
+              <option key={recipient.id} value={recipient.address}>
+                {recipient.label}
+              </option>
+            ))}
+          </datalist>
+        )}
         <button
           type="submit"
           disabled={disabled || !!error || !address}
           data-testid="submit-button"
+          className="w-full sm:w-auto"
           style={{
-            padding: '10px 20px',
+            padding: '12px 20px',
+            minHeight: '44px',
             borderRadius: '8px',
             border: 'none',
             backgroundColor: disabled || !!error || !address ? '#9ca3af' : '#3b82f6',
@@ -192,6 +157,14 @@ export function AddressForm({
           style={{ color: '#16a34a', fontSize: '13px', marginTop: '6px' }}
         >
           Looks good: {truncateAddress(address)}
+        </p>
+      )}
+      {matchedRecipient && (
+        <p
+          data-testid="address-recipient-label"
+          style={{ color: '#6b7280', fontSize: '13px', marginTop: '4px' }}
+        >
+          Saved as &quot;{matchedRecipient.label}&quot;
         </p>
       )}
     </form>

@@ -1,10 +1,14 @@
 // @vitest-environment jsdom
 import React, { act } from "react";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createRoot, Root } from "react-dom/client";
 import OnrampPage from "@/components/routes/onramp-page";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+vi.mock("@/hooks/useDebounce", () => ({
+  useDebounce: <T,>(value: T): T => value,
+}));
 
 describe("OnrampPage buttons", () => {
   let container: HTMLDivElement;

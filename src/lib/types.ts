@@ -1,5 +1,16 @@
+/** Distinguishes a classic G-address from a Soroban C-address. */
 export type AddressType = "G" | "C";
 
+/** Returns the address type prefix character for a given address. */
+export function getAddressType(address: string): AddressType | null {
+  if (!address) return null;
+  const prefix = address.charAt(0).toUpperCase();
+  if (prefix === "G") return "G";
+  if (prefix === "C") return "C";
+  return null;
+}
+
+/** Wallet connection state, including the resolved address and network. */
 export interface WalletState {
   address: string | null;
   publicKey: string | null;
@@ -17,12 +28,29 @@ export interface WalletState {
  */
 export type BridgeTransactionStatus = "pending" | "confirmed" | "failed";
 
-/** How funds reached the destination C-address. */
-export type BridgeTransactionKind = "g-to-c" | "fiat" | "cex";
+/**
+ * How funds moved. `g-to-c`/`fiat`/`cex` are the bridge flows; the rest are
+ * the Horizon operation types a plain account history can contain. (#720)
+ */
+export type BridgeTransactionKind =
+  | "g-to-c"
+  | "fiat"
+  | "cex"
+  | "payment"
+  | "path-payment"
+  | "create-account"
+  | "account-merge"
+  | "contract-transfer";
 
 /** Fiat on-ramp providers the app can quote against. */
 export type OnrampProvider = "moonpay" | "transak";
 
+/** Narrows an OnrampProvider to a string the UI can display. */
+export function isOnrampProvider(value: unknown): value is OnrampProvider {
+  return value === "moonpay" || value === "transak";
+}
+
+/** A recorded bridge transaction with its current lifecycle state. */
 export interface BridgeTransactionData {
   id: string;
   fromAddress: string;
@@ -36,12 +64,21 @@ export interface BridgeTransactionData {
   memo?: string;
 }
 
+/** Narrows a transaction status to the terminal states (confirmed or failed). */
+export function isTerminalStatus(
+  status: BridgeTransactionStatus
+): status is "confirmed" | "failed" {
+  return status === "confirmed" || status === "failed";
+}
+
+/** An asset balance for a Stellar account. */
 export interface Balance {
   asset: string;
   amount: string;
   contractId?: string;
 }
 
+/** A fiat-to-crypto quote returned by an on-ramp provider. */
 export interface OnrampQuote {
   sourceAmount: string;
   destinationAmount: string;
@@ -51,6 +88,7 @@ export interface OnrampQuote {
   cryptoCurrency: string;
 }
 
+/** Configuration for a centralised exchange shown on the /cex route. */
 export interface CexConfig {
   readonly name: string;
   readonly logo: string;
@@ -104,12 +142,39 @@ export const SOROBAN_RPC_URL = {
   TESTNET: process.env.NEXT_PUBLIC_SOROBAN_RPC_URL_TESTNET ?? "https://soroban-testnet.stellar.org",
 } as const;
 
+// Horizon endpoints default to SDF's public hosts but can be overridden per
+// environment via NEXT_PUBLIC_HORIZON_URL_PUBLIC / NEXT_PUBLIC_HORIZON_URL_TESTNET
+// so operators can point the app at their own Horizon instance. (#689)
 export const HORIZON_URL = {
-  PUBLIC: "https://horizon.stellar.org",
-  TESTNET: "https://horizon-testnet.stellar.org",
+  PUBLIC: process.env.NEXT_PUBLIC_HORIZON_URL_PUBLIC ?? "https://horizon.stellar.org",
+  TESTNET: process.env.NEXT_PUBLIC_HORIZON_URL_TESTNET ?? "https://horizon-testnet.stellar.org",
 } as const;
 
+/**
+ * Returns a descriptive configuration error when a required URL is empty, or
+ * `null` when the value is usable. Callers surface the message instead of
+ * letting an empty string resolve to a non-existent hostname. (#689)
+ */
+export function getConfigError(name: string, url: string): string | null {
+  if (!url || url.trim() === "") {
+    return `Missing configuration: ${name} is not set. Provide it via the corresponding NEXT_PUBLIC_* environment variable.`;
+  }
+  return null;
+}
+
 export const BRIDGE_CONTRACT_ID = process.env.NEXT_PUBLIC_BRIDGE_CONTRACT_ID || "";
+
+/**
+ * Maximum number of recipients accepted in a single batch_fund_c_address
+ * call (#465).
+ *
+ * TODO: this is a placeholder. This repo does not vendor the batch contract
+ * source or the batch API client, and no existing constant defines the real
+ * cap — replace this with the actual contract/API limit once it's available,
+ * and update the UI copy that references it (currently derived from this
+ * constant, so no other change should be needed).
+ */
+export const MAX_BATCH_RECIPIENTS = 25;
 
 /**
  * The Stellar network the app connects to. Driven by the `NEXT_PUBLIC_STELLAR_NETWORK`

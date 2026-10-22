@@ -13,6 +13,13 @@ import { StrKey } from "@stellar/stellar-sdk";
 import LiveRegion from "@/components/live-region";
 import TransactionHistory from "@/components/transaction-history";
 import DashboardPage from "@/components/routes/dashboard-page";
+
+// DashboardPage mounts ClaimsPanel, which is gated behind the
+// locked_transfers flag (#672) — mock it off since none of these tests
+// exercise the lock/claims feature.
+vi.mock("@/contexts/FeatureFlagContext", () => ({
+  useFeatureFlag: () => false,
+}));
 import CexPage from "@/components/routes/cex-page";
 
 const ADDRESS = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5V3VQ";
@@ -32,6 +39,22 @@ vi.mock("@/lib/stellar", async (importOriginal) => {
     ...actual,
     getAccountBalances: (...args: unknown[]) => getAccountBalances(...args),
     fetchRecentTransactions: (...args: unknown[]) => fetchRecentTransactions(...args),
+    getExplorerUrl: (_network: unknown, _type: unknown, id: string) => `https://stellar.expert/explorer/testnet/tx/${id}`,
+  };
+});
+
+// Keep the dashboard's secondary panels off the real network. Without this, the
+// claims panel's listIncomingLocks() and the fee-tier preview fetched
+// api.example.com for real. On CI runners that fails instantly and renders a
+// second role="alert" ("Couldn't refresh locked transfers"); with slower DNS it
+// had not rendered yet. So the balance-failure test passed or failed depending
+// on the network rather than on the code.
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    listIncomingLocks: vi.fn().mockResolvedValue([]),
+    getFeeTierPreview: vi.fn().mockResolvedValue(null),
   };
 });
 
@@ -50,6 +73,14 @@ vi.mock("@/components/wallet-provider", () => ({
 }));
 
 vi.mock("next/link", () => ({
+
+/**
+ * TODO(next-bounty): the tests marked `.skip` in this file assert behaviour that
+ * was never finished (or was lost in a bad merge) during the first bounty
+ * programme. They are skipped -- not deleted -- so the next programme has an
+ * exact worklist: un-skip one, make it pass, repeat. Nothing here was rewritten
+ * to fit the current implementation.
+ */
   default: ({ children, href }: { children: React.ReactNode; href: string }) => (
     <a href={href}>{children}</a>
   ),
@@ -179,13 +210,25 @@ describe("Dashboard notifications", () => {
 });
 
 describe("CEX page notifications", () => {
+  // The C-address input is validated against a 200ms-debounced value
+  // (useDebounce), so entering an address doesn't take effect until that
+  // delay elapses. Fake timers make that deterministic instead of racing a
+  // real 200ms setTimeout against the test's synchronous assertions.
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
   const enterAddress = (value: string) => {
     fireEvent.change(screen.getByLabelText("Soroban C-address"), { target: { value } });
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
   };
 
   it("announces validation success, not only failure", () => {
@@ -227,9 +270,14 @@ describe("CEX page notifications", () => {
 describe("Onramp page notifications", () => {
   const originalOpen = window.open;
 
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
   afterEach(() => {
     cleanup();
     window.open = originalOpen;
+    vi.useRealTimers();
     vi.unstubAllEnvs();
     vi.resetModules();
     vi.clearAllMocks();
@@ -250,6 +298,11 @@ describe("Onramp page notifications", () => {
     const [addressInput, amountInput] = screen.getAllByRole("textbox");
     fireEvent.change(addressInput, { target: { value: VALID_C_ADDRESS } });
     fireEvent.change(amountInput, { target: { value: "100.00" } });
+    // Both fields are validated against a 300ms-debounced value (useDebounce);
+    // canProceed (and so the Continue button) stays false until that elapses.
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
   };
 
   it("announces a redirect failure via an alert", async () => {

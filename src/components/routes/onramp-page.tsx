@@ -1,49 +1,25 @@
 "use client";
 
-import { useState } from "react";
-import { CreditCard, Wallet, ExternalLink, ArrowRight, Check, DollarSign, AlertCircle } from "lucide-react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { CreditCard, Wallet, ExternalLink, ArrowRight, Check, DollarSign, AlertCircle, HelpCircle, RefreshCw, Trophy } from "lucide-react";
 import LiveRegion from "@/components/live-region";
 import { isValidStellarAddress, isCAddress } from "@/lib/stellar";
+import {
+  compareOnrampQuotes,
+  quoteSpread,
+  formatQuoteAge,
+  formatQuoteFeeRate,
+  type OnrampQuoteComparison,
+} from "@/lib/onrampQuotes";
+import type { OnrampProvider } from "@/lib/types";
 import { useDebounce } from "@/hooks/useDebounce";
+import { providers, getProviderFeeRate, calculateOnrampFeeAndReceive } from "@/lib/onrampProviders";
+import { useHelp } from "@/contexts/HelpContext";
 
-const MOONPAY_API_KEY = process.env.NEXT_PUBLIC_MOONPAY_API_KEY || "";
-const TRANSAK_API_KEY = process.env.NEXT_PUBLIC_TRANSAK_API_KEY || "";
-
-const providers = [
-  {
-    id: "moonpay",
-    name: "Moonpay",
-    description: "Buy with credit/debit card",
-    fee: "4.5%",
-    limits: "$20 - $10,000",
-    currencies: ["USD", "EUR", "GBP"],
-    supported: true,
-    apiKey: MOONPAY_API_KEY,
-    baseUrl: "https://buy.moonpay.com",
-  },
-  {
-    id: "transak",
-    name: "Transak",
-    description: "Buy with card, Apple Pay, Google Pay",
-    fee: "5%",
-    limits: "$15 - $25,000",
-    currencies: ["USD", "EUR", "GBP", "INR"],
-    supported: true,
-    apiKey: TRANSAK_API_KEY,
-    baseUrl: "https://global.transak.com",
-  },
-];
-
-export function getProviderFeeRate(providerId: string): number {
-  return providerId === "moonpay" ? 0.045 : 0.05;
-}
-
-export function calculateOnrampFeeAndReceive(amount: number, providerId: string) {
-  const feeRate = getProviderFeeRate(providerId);
-  const fee = amount * feeRate;
-  const receive = amount - fee;
-  return { feeRate, fee, receive };
-}
+// Provider config lives in `src/lib/onrampProviders.ts` (#721) so lib code and
+// server routes don't import this client page module. Re-exported for callers
+// that already import from here.
+export { providers, getProviderFeeRate, calculateOnrampFeeAndReceive };
 
 export function buildProviderUrl(p: typeof providers[number], cAddress: string, fiatAmount: string, fiatCurrency: string = "USD"): string {
   // Defence-in-depth: re-validate inputs independently of the button's
@@ -71,7 +47,7 @@ export function buildProviderUrl(p: typeof providers[number], cAddress: string, 
   //      baseCurrencyAmount, baseCurrencyCode, network,
   //      defaultCryptoCurrency, defaultFiatAmount, fiatCurrency) are string
   //      literals in this file — user input is never used as a param key.
-  //   3. Fixed base URL: p.baseUrl comes from the `providers` array above —
+  //   3. Fixed base URL: p.baseUrl comes from the `providers` array (src/lib/onrampProviders.ts) —
   //      hardcoded per-provider host literals — so the scheme + host are not
   //      attacker-controlled.
   // Combined with the isCAddress check above (which enforces a base32 alphabet
@@ -96,7 +72,170 @@ export function buildProviderUrl(p: typeof providers[number], cAddress: string, 
   return `${p.baseUrl}?${params}`;
 }
 
+const QUOTE_REFRESH_INTERVAL_MS = 30_000;
+
+/**
+ * Side-by-side provider comparison (#556). Purely additive to the existing
+ * form — `getProviderFeeRate`/`calculateOnrampFeeAndReceive` above still
+ * drive the single-provider "Estimated Output" box; this ranks all
+ * supported providers against each other for the same amount/currency.
+ *
+ * Live quotes are best-effort: `/api/onramp/quotes` degrades to `{ live: {} }`
+ * when no provider has a live-quote URL configured (see that route's docs),
+ * and a request that fails outright (network error, non-2xx, bad JSON) is
+ * treated the same way — `compareOnrampQuotes` always has its own estimate
+ * to fall back on, so a fetch failure never blanks the panel.
+ */
+function QuoteComparisonPanel({
+  fiatAmount,
+  fiatCurrency,
+  isValid,
+  cAddress,
+}: {
+  fiatAmount: string;
+  fiatCurrency: string;
+  isValid: boolean;
+  /**
+   * Destination C-address, when a valid one has been entered. The backend's
+   * live quote endpoint requires an address (#678), but this panel can
+   * render before one is entered -- omitting it here simply skips the live
+   * fetch for this refresh and keeps the local estimate. (#678)
+   */
+  cAddress?: string;
+}) {
+  const [loadedComparisons, setLoadedComparisons] = useState<{ query: string; items: OnrampQuoteComparison[] } | null>(null);
+  const [quotedAt, setQuotedAt] = useState<number | null>(null);
+  const [, forceTick] = useState(0);
+  const requestIdRef = useRef(0);
+
+  const amount = Number(fiatAmount) || 0;
+  const query = `${amount}:${fiatCurrency}`;
+
+  const refresh = useCallback(async () => {
+    if (!isValid || amount <= 0) return;
+    const requestId = ++requestIdRef.current;
+    try {
+      const params = new URLSearchParams({ amount: String(amount), currency: fiatCurrency });
+      if (cAddress) params.set("cAddress", cAddress);
+      const res = await fetch(`/api/onramp/quotes?${params.toString()}`);
+      if (!res.ok) return;
+      const data: unknown = await res.json();
+      // A slower response for a superseded amount/currency must not clobber
+      // a newer one that already resolved.
+      if (requestId !== requestIdRef.current) return;
+      const live = (data as { live?: Partial<Record<OnrampProvider, { sourceAmount: string; destinationAmount: string; fee: string }>> }).live ?? {};
+      setLoadedComparisons({ query, items: compareOnrampQuotes(amount, fiatCurrency, { liveQuotes: live }) });
+      setQuotedAt(Date.now());
+    } catch {
+      // Network failure: the local-estimate comparison set above stands.
+    }
+  }, [amount, fiatCurrency, isValid, query]);
+
+  useEffect(() => {
+    if (!isValid || amount <= 0) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) void refresh();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [refresh, isValid, amount]);
+
+  // Timed refresh while a valid amount is entered, plus a 1s tick so the
+  // "quoted Xs ago" age display stays live between refreshes.
+  useEffect(() => {
+    if (!isValid || amount <= 0) return;
+    const refreshTimer = setInterval(refresh, QUOTE_REFRESH_INTERVAL_MS);
+    const tickTimer = setInterval(() => forceTick((n) => n + 1), 1000);
+    return () => {
+      clearInterval(refreshTimer);
+      clearInterval(tickTimer);
+    };
+  }, [refresh, isValid, amount]);
+
+  if (!isValid || amount <= 0) return null;
+
+  const comparisons = loadedComparisons?.query === query
+    ? loadedComparisons.items
+    : compareOnrampQuotes(amount, fiatCurrency);
+  const spread = quoteSpread(comparisons);
+
+  return (
+    <div className="card p-5" data-testid="quote-comparison-panel">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-semibold">Compare Providers</h3>
+        <button
+          type="button"
+          onClick={refresh}
+          aria-label="Refresh quotes"
+          data-testid="quote-refresh-button"
+          className="p-1.5 rounded hover:bg-[var(--surface-2)] text-[var(--text-muted)] transition-colors"
+        >
+          <RefreshCw className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {comparisons.length === 0 ? (
+        <p className="text-sm text-[var(--text-muted)]">
+          No provider currently supports {fiatCurrency} for this comparison.
+        </p>
+      ) : (
+        <>
+          <ul className="space-y-2" data-testid="quote-comparison-list">
+            {comparisons.map((q) => (
+              <li
+                key={q.provider}
+                data-testid={`quote-row-${q.provider}`}
+                className={`p-3 rounded-lg border ${
+                  q.isBest ? "border-[var(--primary)] bg-[var(--primary)]/5" : "border-[var(--border)] bg-[var(--surface-2)]"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <span className="text-sm font-medium flex items-center gap-1.5">
+                    {q.isBest && <Trophy className="w-3.5 h-3.5 text-[var(--primary)]" aria-hidden="true" />}
+                    {q.providerName}
+                    {q.isBest && <span className="sr-only"> — best rate</span>}
+                  </span>
+                  <span className="text-xs text-[var(--text-muted)]">
+                    {q.source === "live" ? "Live" : "Estimated"}
+                  </span>
+                </div>
+                <div className="flex justify-between text-xs text-[var(--text-muted)]">
+                  <span>Rate ({formatQuoteFeeRate(q.provider)} fee)</span>
+                  <span className="tabular-nums">-{q.fee} {q.fiatCurrency}</span>
+                </div>
+                <div className="flex justify-between text-sm font-semibold mt-1">
+                  <span className="text-[var(--text-muted)] font-normal text-xs self-center">You receive</span>
+                  <span className="tabular-nums">{q.destinationAmount} USDC</span>
+                </div>
+                {q.withinLimits === false && (
+                  <p className="text-xs text-[var(--error)] mt-1" role="alert">
+                    Outside {q.providerName}&apos;s advertised limits for this amount.
+                  </p>
+                )}
+              </li>
+            ))}
+          </ul>
+
+          {spread && (
+            <p className="text-xs text-[var(--text-muted)] mt-3" data-testid="quote-spread">
+              Best vs. worst: {spread.absolute.toFixed(2)} USDC ({spread.percent.toFixed(1)}%) apart.
+            </p>
+          )}
+          {quotedAt && (
+            <p className="text-xs text-[var(--text-muted)] mt-1" data-testid="quote-age">
+              Quoted {formatQuoteAge(quotedAt)}
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function OnrampPage() {
+  const { openHelp } = useHelp();
   const [cAddress, setCAddress] = useState("");
   const [fiatAmount, setFiatAmount] = useState("");
   const [selectedProvider, setSelectedProvider] = useState("moonpay");
@@ -184,7 +323,7 @@ export default function OnrampPage() {
               }
             />
             {step === "form" && (
-              <div className="space-y-6">
+              <div className="space-y-6" data-testid="onramp-form">
                 <div>
                   <label className="block text-sm font-medium mb-3">Select Provider</label>
                   {/* Single column on phones: at ~320px two provider cards left the
@@ -195,6 +334,7 @@ export default function OnrampPage() {
                       <button
                         key={p.id}
                         type="button"
+                        data-testid={`onramp-provider-${p.id}`}
                         onClick={() => handleProviderSelect(p.id)}
                         aria-pressed={selectedProvider === p.id}
                         className={`p-4 rounded-lg border text-left transition-all ${
@@ -364,6 +504,20 @@ export default function OnrampPage() {
         </div>
 
         <div className="space-y-4">
+          <QuoteComparisonPanel
+            fiatAmount={debouncedFiatAmount}
+            fiatCurrency={fiatCurrency}
+            isValid={validAmount && debouncedFiatAmount === fiatAmount}
+            cAddress={
+              debouncedCAddress &&
+              debouncedCAddress === cAddress &&
+              isValidStellarAddress(debouncedCAddress) &&
+              isCAddress(debouncedCAddress)
+                ? debouncedCAddress
+                : undefined
+            }
+          />
+
           <div className="card p-5">
             <h3 className="font-semibold mb-3">Supported Providers</h3>
             <div className="space-y-3">
@@ -406,15 +560,14 @@ export default function OnrampPage() {
             <p className="text-sm text-[var(--text-muted)] mb-3">
               Make sure your C-address is valid before continuing.
             </p>
-            <a
-              href="https://developers.stellar.org/docs/build/smart-contracts"
-              target="_blank"
-              rel="noopener noreferrer"
+            <button
+              type="button"
+              onClick={openHelp}
               className="inline-flex items-center gap-2 text-sm text-[var(--primary-light)] hover:underline"
             >
-              Learn about Soroban addresses
-              <ArrowRight className="w-4 h-4" />
-            </a>
+              <HelpCircle className="w-4 h-4" />
+              Open help centre
+            </button>
           </div>
         </div>
       </div>

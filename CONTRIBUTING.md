@@ -53,6 +53,21 @@ CI runs four checks on every push and pull request. Run each locally before push
 
 All four must pass before opening a pull request.
 
+## Visual Testing Decision
+
+The repository does not currently run visual-baseline comparisons. The parked
+Storybook/Percy workflow, its unused stories, and its capture tooling were
+removed because Storybook and Percy are not configured project dependencies and
+CI has no Percy token. Keeping a manually dispatched workflow that cannot run
+would imply coverage the project does not have.
+
+Playwright E2E tests remain the browser-based check. They capture screenshots
+and videos when a test fails for debugging; these artifacts are not approved
+visual baselines and do not detect visual changes on their own. For UI changes,
+include screenshots in the pull request as described by the PR template.
+
+This speeds up local testing during development.
+
 ## Branch Naming
 
 Use a descriptive prefix followed by the issue number and a short slug:
